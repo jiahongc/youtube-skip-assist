@@ -308,6 +308,7 @@
       seekTargetMs: seg.seekTargetMs,
       source: seg.source || null,
       done: Boolean(seg.done),
+      pending: Boolean(seg.pending),
     };
   }
 
@@ -905,7 +906,12 @@
   // ── Arm the auto-skip handler ────────────────────────────────────────────
 
   let activeSegments = [];
+  let handledRanges = [];
+  let handledVideoId = getCurrentVideoId();
+  let lastCompletedSkip = null;
+  let lastSkipNoticeKey = null;
   let handler = null;
+  let seekingHandler = null;
   let attachedVideo = null;
   let pendingRetryTimers = [];
   let heartbeatInterval = null;
@@ -919,26 +925,187 @@
   }
 
   const LISTEN_EVENTS = ['timeupdate', 'playing', 'seeked'];
+  const UNDO_PLAYBACK_WINDOW_MS = 7000;
+  const SKIP_NOTICE_REALTIME_MS = 5000;
 
   // Don't auto-skip in the opening seconds of playback. Avoids the jarring
   // "skipped the instant I opened the video" when YouTube ships a jump-ahead
   // or chapter segment with a very low trigger time.
   const SKIP_GRACE_MS = 5000;
 
-  // Standalone skip-check — called by event listeners AND heartbeat
-  function checkSkipPoints(video) {
-    if (isMusicVideo || !video || video.paused || !activeSegments.length) return;
-    const ms = video.currentTime * 1000;
-    if (ms < SKIP_GRACE_MS) return;
+  function clearSkipNotice() {
+    if (lastSkipNoticeKey === null) return;
+    lastSkipNoticeKey = null;
+    window.postMessage({ source: 'autoskip', type: 'skip-notice-hide' }, '*');
+  }
 
-    // Segments stay done once skipped — if the user seeks back, they
-    // intentionally want to watch that section.  Segments only reset
-    // on video navigation (reset() clears activeSegments entirely).
+  function syncHandledRangesForVideo(videoId) {
+    if (videoId === handledVideoId) return;
+    handledVideoId = videoId;
+    handledRanges = [];
+    lastCompletedSkip = null;
+    clearSkipNotice();
+  }
+
+  function normalizeRange(fromSec, toSec) {
+    const fromMs = Number(fromSec) * 1000;
+    const toMs = Number(toSec) * 1000;
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return null;
+    return { fromMs, toMs };
+  }
+
+  function rangeMatchesSegment(range, seg) {
+    return Math.abs(range.toMs - seg.seekTargetMs) < 2500 &&
+      range.fromMs >= seg.triggerMs - 1500 &&
+      range.fromMs < seg.seekTargetMs;
+  }
+
+  function isSegmentHandled(seg) {
+    return handledRanges.some(range => rangeMatchesSegment(range, seg));
+  }
+
+  function rememberHandledRange(fromSec, toSec) {
+    syncHandledRangesForVideo(getCurrentVideoId());
+    const range = normalizeRange(fromSec, toSec);
+    if (!range) return null;
+    const exists = handledRanges.some(
+      item => Math.abs(item.fromMs - range.fromMs) < 500 && Math.abs(item.toMs - range.toMs) < 500
+    );
+    if (!exists) handledRanges.push(range);
 
     for (const seg of activeSegments) {
-      if (seg.done) continue;
+      if (!rangeMatchesSegment(range, seg)) continue;
+      seg.done = true;
+      seg.pending = false;
+    }
+    clearSkipNotice();
+    jumpAheadDebug.activeSegments = activeSegments.map(serializeSegment);
+    return range;
+  }
+
+  function recordCompletedSkip(fromSec, toSec) {
+    const range = rememberHandledRange(fromSec, toSec);
+    if (!range) return;
+    lastCompletedSkip = range;
+  }
+
+  function clearUndoForRange(fromSec, toSec) {
+    const range = normalizeRange(fromSec, toSec);
+    if (!range || !lastCompletedSkip) return;
+    if (Math.abs(range.fromMs - lastCompletedSkip.fromMs) < 500 &&
+        Math.abs(range.toMs - lastCompletedSkip.toMs) < 500) {
+      lastCompletedSkip = null;
+    }
+  }
+
+  function seekToSegmentStart(fromSec, toSec) {
+    const range = rememberHandledRange(fromSec, toSec);
+    if (!range) return false;
+    const video = document.querySelector('video');
+    if (!video) return false;
+
+    const from = range.fromMs / 1000;
+    const player = document.getElementById('movie_player');
+    if (player && typeof player.seekTo === 'function') {
+      player.seekTo(from, true);
+    } else {
+      video.currentTime = from;
+    }
+    lastCompletedSkip = null;
+    window.postMessage({
+      source: 'autoskip',
+      type: 'segment-undone',
+      fromSec: from,
+      toSec: range.toMs / 1000,
+    }, '*');
+    return true;
+  }
+
+  function isEditableTarget(event) {
+    const target = event.composedPath?.()[0] || event.target;
+    return target instanceof Element && Boolean(
+      target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]')
+    );
+  }
+
+  function getPlaybackRate(video) {
+    const rate = Number(video?.playbackRate);
+    return Number.isFinite(rate) && rate > 0 ? rate : 1;
+  }
+
+  function updateSkipNotice(video, currentMs) {
+    const noticeLeadMs = SKIP_NOTICE_REALTIME_MS * getPlaybackRate(video);
+    if (isMusicVideo || video.paused || currentMs < Math.max(0, SKIP_GRACE_MS - noticeLeadMs)) {
+      clearSkipNotice();
+      return;
+    }
+
+    let upcoming = null;
+    for (const seg of activeSegments) {
+      if (seg.done || seg.pending || isSegmentHandled(seg)) continue;
+      const effectiveTriggerMs = Math.max(seg.triggerMs, SKIP_GRACE_MS);
+      const remainingMs = effectiveTriggerMs - currentMs;
+      if (remainingMs <= 0 || remainingMs > noticeLeadMs) continue;
+      if (!upcoming || effectiveTriggerMs < upcoming.effectiveTriggerMs) {
+        upcoming = { seg, effectiveTriggerMs, remainingMs };
+      }
+    }
+
+    if (!upcoming) {
+      clearSkipNotice();
+      return;
+    }
+
+    const key = `${upcoming.seg.triggerMs}|${upcoming.seg.seekTargetMs}`;
+    if (key === lastSkipNoticeKey) return;
+    lastSkipNoticeKey = key;
+    window.postMessage({
+      source: 'autoskip',
+      type: 'skip-notice',
+      fromSec: upcoming.seg.triggerMs / 1000,
+      toSec: upcoming.seg.seekTargetMs / 1000,
+    }, '*');
+  }
+
+  // YouTube normally handles ArrowLeft as a five-second rewind. Immediately
+  // after an auto-skip, make the first press a precise undo instead.
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' || event.repeat || event.altKey || event.ctrlKey ||
+        event.metaKey || event.shiftKey || isEditableTarget(event)) return;
+    if (!lastCompletedSkip) return;
+
+    const video = document.querySelector('video');
+    if (!video) return;
+    const currentMs = video.currentTime * 1000;
+    if (currentMs < lastCompletedSkip.toMs - 1500 ||
+        currentMs > lastCompletedSkip.toMs + UNDO_PLAYBACK_WINDOW_MS) return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    seekToSegmentStart(lastCompletedSkip.fromMs / 1000, lastCompletedSkip.toMs / 1000);
+  }, true);
+
+  // Standalone skip-check — called by event listeners AND heartbeat
+  function checkSkipPoints(video) {
+    if (!video) return;
+    const ms = video.currentTime * 1000;
+    if (lastCompletedSkip &&
+        (ms < lastCompletedSkip.fromMs - 1500 ||
+         ms > lastCompletedSkip.toMs + UNDO_PLAYBACK_WINDOW_MS)) {
+      lastCompletedSkip = null;
+    }
+    updateSkipNotice(video, ms);
+    if (isMusicVideo || video.paused || !activeSegments.length) return;
+    if (ms < SKIP_GRACE_MS) return;
+
+    // Handled ranges survive same-video lifecycle resets. If the user seeks
+    // back, they intentionally want to watch that section.
+
+    for (const seg of activeSegments) {
+      if (seg.done || seg.pending || isSegmentHandled(seg)) continue;
       // Trigger anywhere between start and end of the skip zone
       if (ms >= seg.triggerMs && ms < seg.seekTargetMs - 500) {
+        clearSkipNotice();
         const fromSec = seg.triggerMs / 1000;
         const toSec = seg.seekTargetMs / 1000;
         jumpAheadDebug.lastSkip = {
@@ -948,6 +1115,12 @@
           segment: serializeSegment(seg),
         };
         debugLog('attempt skip', jumpAheadDebug.lastSkip);
+
+        // Block duplicate checks while the seek is being verified. If the
+        // user seeks back during this window, the seeking handler below marks
+        // only this range as handled instead of immediately skipping it again.
+        seg.pending = true;
+        lastCompletedSkip = normalizeRange(fromSec, toSec);
 
         // Tell content.js a data-driven skip is in progress so it doesn't
         // also click the DOM button for the same segment.
@@ -962,8 +1135,10 @@
 
         setTimeout(() => {
           const after = video.currentTime * 1000;
+          seg.pending = false;
           if (after >= seg.seekTargetMs - 2000) {
             seg.done = true;
+            recordCompletedSkip(fromSec, toSec);
             const skipSec = Math.round((after - ms) / 1000);
             jumpAheadDebug.lastSkip = {
               phase: 'success',
@@ -1008,6 +1183,9 @@
     if (handler && attachedVideo) {
       for (const evt of LISTEN_EVENTS) attachedVideo.removeEventListener(evt, handler);
     }
+    if (seekingHandler && attachedVideo) {
+      attachedVideo.removeEventListener('seeking', seekingHandler);
+    }
   }
 
   function attachHandlerIfReady() {
@@ -1019,8 +1197,19 @@
     detachHandler();
 
     handler = () => checkSkipPoints(video);
+    seekingHandler = () => {
+      const ms = video.currentTime * 1000;
+      const pendingSegment = activeSegments.find(
+        seg => seg.pending && ms >= seg.triggerMs && ms < seg.seekTargetMs - 250
+      );
+      if (pendingSegment) {
+        rememberHandledRange(pendingSegment.triggerMs / 1000, pendingSegment.seekTargetMs / 1000);
+        lastCompletedSkip = null;
+      }
+    };
 
     for (const evt of LISTEN_EVENTS) video.addEventListener(evt, handler);
+    video.addEventListener('seeking', seekingHandler);
     startHeartbeat();
     attachedVideo = video;
     return true;
@@ -1061,7 +1250,7 @@
     // Merge, avoiding duplicates by full skip window and label.
     for (const seg of newSegments) {
       if (!activeSegments.some(s => s.triggerMs === seg.triggerMs && s.seekTargetMs === seg.seekTargetMs && s.label === seg.label)) {
-        activeSegments.push({ ...seg, done: false });
+        activeSegments.push({ ...seg, done: isSegmentHandled(seg), pending: false });
         recordArmEvent(seg, nowMs);
       }
     }
@@ -1274,8 +1463,11 @@
   // ── Reset on video change ────────────────────────────────────────────────
 
   function reset() {
-    currentVideoId = getCurrentVideoId();
+    const nextVideoId = getCurrentVideoId();
+    syncHandledRangesForVideo(nextVideoId);
+    currentVideoId = nextVideoId;
     activeSegments = [];
+    clearSkipNotice();
     cachedLang = null;
     isMusicVideo = false;
     hasSentMusicState = false;
@@ -1285,6 +1477,7 @@
     stopHeartbeat();
     detachHandler();
     handler = null;
+    seekingHandler = null;
     attachedVideo = null;
     resetJumpAheadDebug(currentVideoId);
     debugLog('reset', { currentVideoId });
@@ -1450,7 +1643,7 @@
   // Messages from content.js (settings + DOM button events)
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
-    if (e.origin !== 'https://www.youtube.com') return;
+    if (e.origin !== window.location.origin) return;
     const data = e.data;
     if (!data || typeof data !== 'object') return;
     if (data.source === 'autoskip-config' && data.type === 'settings') {
@@ -1459,6 +1652,19 @@
     }
     if (data.source === 'autoskip-dom' && data.type === 'jump-button-event') {
       onDomButtonEvent(data);
+      return;
+    }
+    if (data.source === 'autoskip-dom' && data.type === 'segment-skipped') {
+      recordCompletedSkip(data.fromSec, data.toSec);
+      return;
+    }
+    if (data.source === 'autoskip-control' && data.type === 'suppress-segment') {
+      rememberHandledRange(data.fromSec, data.toSec);
+      clearUndoForRange(data.fromSec, data.toSec);
+      return;
+    }
+    if (data.source === 'autoskip-control' && data.type === 'undo-segment') {
+      seekToSegmentStart(data.fromSec, data.toSec);
     }
   });
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.18
+
+- Made the pre-skip notice playback-speed aware so it appears about five real-world seconds before a known skip at speeds such as 2× or 0.5×.
+
+## 1.17
+
+- Replaced the countdown with a single `Jump Ahead detected, skipping soon.` notice shown up to five seconds before a known skip.
+
+## 1.16
+
+- Clarified the countdown notice to read `Jump Ahead detected — skipping in 3…`.
+
+## 1.15
+
+- Preserved handled-segment suppression across same-video YouTube lifecycle events, preventing replayed segments from being skipped again.
+- Added a three-second on-player countdown before known upcoming automatic skips.
+
+## 1.14
+
+- Pressing the left arrow immediately after an automatic skip now returns to the start of that skipped segment.
+- Manually seeking back into a skipped segment suppresses only that segment for the current video; later segments continue to skip normally.
+- Updated the on-screen Undo action to use the same per-segment suppression behavior.
+
 ## 1.13
 
 Chrome Web Store submission prep (no behavior change):

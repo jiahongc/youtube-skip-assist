@@ -19,6 +19,42 @@ let musicVideoBlocked = false;
 let skipInProgress = false;
 let skipInProgressTimer = null;
 let doneZones = []; // [{from, to}] — time ranges (seconds) already skipped
+let doneZonesVideoId = getCurrentVideoId();
+
+function getCurrentVideoId() {
+  try {
+    return new URLSearchParams(window.location.search).get('v') || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function syncDoneZonesToCurrentVideo() {
+  const videoId = getCurrentVideoId();
+  if (videoId === doneZonesVideoId) return;
+  doneZonesVideoId = videoId;
+  doneZones = [];
+}
+
+function rememberDoneZone(from, to) {
+  syncDoneZonesToCurrentVideo();
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
+  const alreadyRemembered = doneZones.some(
+    zone => Math.abs(zone.from - from) < 0.5 && Math.abs(zone.to - to) < 0.5
+  );
+  if (!alreadyRemembered) doneZones.push({ from, to });
+}
+
+function postSegmentControl(type, fromSec, toSec) {
+  if (!Number.isFinite(fromSec) || !Number.isFinite(toSec)) return;
+  rememberDoneZone(fromSec, toSec);
+  window.postMessage({
+    source: 'autoskip-control',
+    type,
+    fromSec,
+    toSec,
+  }, '*');
+}
 
 const SKIP_SELECTORS = [
   '.ytp-jump-ahead-button',
@@ -105,13 +141,15 @@ function showToast(arg) {
 
   // Back-compat: allow showToast('message') and showToast({ message, fromSec, toSec })
   const opts = typeof arg === 'string' ? { message: arg } : (arg || {});
-  const { message = '', fromSec, toSec } = opts;
+  const { message = '', fromSec, toSec, kind = 'skip', durationMs = 5000 } = opts;
   const canUndo = Number.isFinite(fromSec);
 
   let t = document.getElementById('autoskip-toast');
   if (!t) {
     t = document.createElement('div');
     t.id = 'autoskip-toast';
+    t.setAttribute('role', 'status');
+    t.setAttribute('aria-live', 'polite');
     Object.assign(t.style, {
       position: 'absolute', bottom: '64px', left: '50%',
       transform: 'translateX(-50%)',
@@ -150,15 +188,8 @@ function showToast(arg) {
       ev.stopPropagation();
       const target = Number(undoBtn.dataset.fromSec);
       const prevTo = Number(undoBtn.dataset.toSec);
-      if (!Number.isFinite(target)) return;
-      const video = document.querySelector('video');
-      if (video) {
-        video.currentTime = Math.max(0, target - 0.25);
-      }
-      // Remove matching done zone so we don't immediately re-skip
-      if (Number.isFinite(prevTo)) {
-        doneZones = doneZones.filter(z => !(Math.abs(z.from - target) < 0.5 && Math.abs(z.to - prevTo) < 0.5));
-      }
+      if (!Number.isFinite(target) || !Number.isFinite(prevTo)) return;
+      postSegmentControl('undo-segment', target, prevTo);
       t.style.opacity = '0';
       clearTimeout(t._t);
     });
@@ -166,6 +197,8 @@ function showToast(arg) {
 
     player.appendChild(t);
   }
+
+  t.dataset.kind = kind;
 
   // SECURITY: use textContent, never innerHTML — message contains untrusted chapter titles
   const textEl = t.querySelector('#autoskip-toast-text');
@@ -180,7 +213,14 @@ function showToast(arg) {
 
   t.style.opacity = '1';
   clearTimeout(t._t);
-  t._t = setTimeout(() => (t.style.opacity = '0'), 5000);
+  t._t = setTimeout(() => (t.style.opacity = '0'), durationMs);
+}
+
+function hideToast(kind) {
+  const toast = document.getElementById('autoskip-toast');
+  if (!toast || (kind && toast.dataset.kind !== kind)) return;
+  toast.style.opacity = '0';
+  clearTimeout(toast._t);
 }
 
 function formatClock(totalSeconds) {
@@ -276,10 +316,11 @@ function isFullscreenPlayer(player) {
 
 window.addEventListener('message', (e) => {
   if (e.source !== window) return;
-  if (e.origin !== 'https://www.youtube.com') return;
+  if (e.origin !== window.location.origin) return;
   if (e.data?.source !== 'autoskip') return;
 
   if (e.data.type === 'skip-in-progress') {
+    hideToast('skip-notice');
     skipInProgress = true;
     clearTimeout(skipInProgressTimer);
     skipInProgressTimer = setTimeout(() => { skipInProgress = false; }, 2000);
@@ -287,17 +328,34 @@ window.addEventListener('message', (e) => {
     return;
   }
 
+  if (e.data.type === 'skip-notice') {
+    showToast({
+      message: 'Jump Ahead detected, skipping soon.',
+      kind: 'skip-notice',
+      durationMs: 6000,
+    });
+    return;
+  }
+
+  if (e.data.type === 'skip-notice-hide') {
+    hideToast('skip-notice');
+    return;
+  }
+
   if (e.data.type === 'skipped') {
     const { seconds: sec, label, fromSec, toSec } = e.data;
-    if (fromSec != null && toSec != null) {
-      doneZones.push({ from: fromSec, to: toSec });
-    }
+    rememberDoneZone(fromSec, toSec);
     debugLog('content skipped', e.data);
     showToast({
       message: formatToastMessage(label, sec, fromSec, toSec),
       fromSec,
       toSec,
     });
+    return;
+  }
+
+  if (e.data.type === 'segment-undone') {
+    hideToast();
     return;
   }
 
@@ -311,6 +369,7 @@ window.addEventListener('message', (e) => {
 let lastClick = 0;
 
 function isInDoneZone() {
+  syncDoneZonesToCurrentVideo();
   const video = document.querySelector('video');
   if (!video) return false;
   const t = video.currentTime;
@@ -414,7 +473,13 @@ function clickBtn(btn) {
     const after = video.currentTime;
     const sec = Math.round(after - before);
     if (sec > 2) {
-      doneZones.push({ from: before, to: after });
+      rememberDoneZone(before, after);
+      window.postMessage({
+        source: 'autoskip-dom',
+        type: 'segment-skipped',
+        fromSec: before,
+        toSec: after,
+      }, '*');
       showToast({
         message: formatToastMessage(label, sec, before, after),
         fromSec: before,
@@ -459,9 +524,22 @@ if (document.body) {
 // a tracked DOM mutation (e.g. CSS transitions, opacity animations).
 setInterval(scanForSkipButton, 1000);
 
-// Clear done zones on navigation so they don't persist across videos.
+// Seeking back into a handled range is intentional. Keep that one range
+// suppressed while allowing every other segment in the video to auto-skip.
+document.addEventListener('seeking', (event) => {
+  const video = event.target;
+  if (!(video instanceof HTMLVideoElement)) return;
+  const zone = doneZones.find(
+    candidate => video.currentTime >= candidate.from && video.currentTime < candidate.to - 0.25
+  );
+  if (zone) postSegmentControl('suppress-segment', zone.from, zone.to);
+}, true);
+
+// Preserve handled ranges through same-video lifecycle events. YouTube can
+// emit yt-navigate-finish without changing the video.
 document.addEventListener('yt-navigate-finish', () => {
-  doneZones = [];
+  syncDoneZonesToCurrentVideo();
+  hideToast('skip-notice');
 });
 
 loadSettings();
